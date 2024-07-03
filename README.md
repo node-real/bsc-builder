@@ -79,6 +79,14 @@ Address = "0x..."
 URL = "https://bsc-mathwallet.io"
 ```
 
+Step 3: Startup
+
+command example:
+```
+nohup /server/bsc/builder/geth_builder --config /server/bsc/builder/config.toml --datadir /server/bsc/builder/ --password /server/bsc/builder/password.txt --nodekey /server/bsc/builder/geth/nodekey -unlock 0x24e1652D280dAC12e402BEa00bECCab1D11A25B2 --miner.etherbase 0x24e1652D280dAC12e402BEa00bECCab1D11A25B2 --rpc.allow-unprotected-txs --allow-insecure-unlock --ws.addr 0.0.0.0 --ws.port 8546 --http.addr 0.0.0.0 --http.port 8546 --metrics.addr 0.0.0.0 --metrics.port 6061 --metrics.expensive --gcmode archive --state.scheme hash --syncmode full --mine  --monitor.maliciousvote --port 35555 --tries-verify-mode none > bsc-node.log &
+```
+notice: builder is a fullnode, and should using `--mine` to open block building.
+
 ## License
 
 The bsc library (i.e. all code outside of the `cmd` directory) is licensed under the
