@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/miner/validatorclient"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -20,6 +21,9 @@ import (
 )
 
 const maxBid int64 = 3
+
+var bidSimulationLeftOver = 50 * time.Millisecond
+var bidSendLeftOver = 20 * time.Millisecond
 
 type ValidatorConfig struct {
 	Address common.Address
@@ -44,15 +48,15 @@ type Bidder struct {
 	bestWorksMu sync.RWMutex
 	bestWorks   map[int64]*environment
 
-	newBidCh chan *environment
-	exitCh   chan struct{}
+	chainHeadCh  chan core.ChainHeadEvent
+	chainHeadSub event.Subscription
 
-	wg sync.WaitGroup
+	exitCh chan struct{}
 
 	wallet accounts.Wallet
 }
 
-func NewBidder(config *MevConfig, delayLeftOver time.Duration, engine consensus.Engine, eth Backend) *Bidder {
+func NewBidder(config *MevConfig, chain *core.BlockChain, delayLeftOver time.Duration, engine consensus.Engine, eth Backend) *Bidder {
 	b := &Bidder{
 		config:        config,
 		delayLeftOver: delayLeftOver,
@@ -60,9 +64,16 @@ func NewBidder(config *MevConfig, delayLeftOver time.Duration, engine consensus.
 		chain:         eth.BlockChain(),
 		validators:    make(map[common.Address]*validator),
 		bestWorks:     make(map[int64]*environment),
-		newBidCh:      make(chan *environment, 10),
+		chainHeadCh:   make(chan core.ChainHeadEvent, chainHeadChanSize),
 		exitCh:        make(chan struct{}),
 	}
+
+	if config.BidSendLeftOver == 0 {
+		config.BidSendLeftOver = bidSendLeftOver
+		log.Info("Bidder: use default bid send left over", "duration", bidSendLeftOver)
+	}
+
+	b.chainHeadSub = chain.SubscribeChainHeadEvent(b.chainHeadCh)
 
 	if !config.BuilderEnabled {
 		return b
@@ -83,7 +94,6 @@ func NewBidder(config *MevConfig, delayLeftOver time.Duration, engine consensus.
 		log.Warn("Bidder: No valid validators")
 	}
 
-	b.wg.Add(2)
 	go b.mainLoop()
 	go b.reconnectLoop()
 
@@ -91,66 +101,69 @@ func NewBidder(config *MevConfig, delayLeftOver time.Duration, engine consensus.
 }
 
 func (b *Bidder) mainLoop() {
-	defer b.wg.Done()
+	defer b.chainHeadSub.Unsubscribe()
 
-	timer := time.NewTimer(0)
-	defer timer.Stop()
-	<-timer.C // discard the initial tick
+	if !b.enabled() {
+		return
+	}
 
-	var (
-		bidNum          int64 = 0
-		betterBidBefore time.Time
-		currentHeight   = b.chain.CurrentBlock().Number.Int64()
-	)
-	for {
-		select {
-		case work := <-b.newBidCh:
-			if work.header.Number.Int64() > currentHeight {
-				currentHeight = work.header.Number.Int64()
+	for chainHeadEvent := range b.chainHeadCh {
+		currentNumber := chainHeadEvent.Block.Number().Int64()
+		b.deleteBestWork(currentNumber)
 
-				bidNum = 0
-				parentHeader := b.chain.GetHeaderByHash(work.header.ParentHash)
-				var bidSimulationLeftOver time.Duration
-				b.validatorsMu.RLock()
-				if b.validators[work.coinbase] != nil {
-					bidSimulationLeftOver = b.validators[work.coinbase].BidSimulationLeftOver
+		nextBlockNumber := currentNumber + 1
+		betterBidBefore := bidutil.BidBetterBefore(chainHeadEvent.Block.Header(), b.chain.Config().Parlia.Period,
+			b.delayLeftOver, bidSimulationLeftOver)
+
+		if betterBidBefore.Before(time.Now()) {
+			continue
+		}
+
+		first := time.NewTimer(time.Until(betterBidBefore.Add(-3 * b.config.BidSendLeftOver)))
+		second := time.NewTimer(time.Until(betterBidBefore.Add(-2 * b.config.BidSendLeftOver)))
+		third := time.NewTimer(time.Until(betterBidBefore.Add(-b.config.BidSendLeftOver)))
+		exit := time.NewTimer(time.Until(betterBidBefore))
+
+	LOOP:
+		for {
+			select {
+			case <-first.C:
+				work := b.getBestWork(nextBlockNumber)
+				if work != nil {
+					log.Info("Bidder: try to bid (first)", "number", nextBlockNumber)
+					go b.bid(work)
 				}
-				b.validatorsMu.RUnlock()
-				betterBidBefore = bidutil.BidBetterBefore(parentHeader, b.chain.Config().Parlia.Period, b.delayLeftOver,
-					bidSimulationLeftOver)
-
-				if time.Now().After(betterBidBefore) {
-					timer.Reset(0)
-				} else {
-					timer.Reset(time.Until(betterBidBefore) / time.Duration(maxBid))
+			case <-second.C:
+				work := b.getBestWork(nextBlockNumber)
+				if work != nil {
+					log.Info("Bidder: try to bid (second)", "number", nextBlockNumber)
+					go b.bid(work)
 				}
+			case <-third.C:
+				work := b.getBestWork(nextBlockNumber)
+				if work != nil {
+					log.Info("Bidder: try to bid (third)", "number", nextBlockNumber)
+					go b.bid(work)
+				}
+			case <-exit.C:
+				break LOOP
+			case <-b.exitCh:
+				return
+			case <-b.chainHeadSub.Err():
+				log.Error("Bidder: chain head sub error")
+				return
 			}
-			if bidNum < maxBid && b.isBestWork(work) {
-				// update the bestWork and do bid
-				b.setBestWork(work)
-			}
-		case <-timer.C:
-			go func() {
-				w := b.getBestWork(currentHeight)
-				if w != nil {
-					b.bid(w)
-					bidNum++
-					if bidNum < maxBid && time.Now().Before(betterBidBefore) {
-						timer.Reset(time.Until(betterBidBefore) / time.Duration(maxBid-bidNum))
-					}
-				}
-			}()
-		case <-b.exitCh:
-			return
 		}
 	}
 }
 
 func (b *Bidder) reconnectLoop() {
-	defer b.wg.Done()
-
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
+
+	if !b.enabled() {
+		return
+	}
 
 	for {
 		select {
@@ -209,16 +222,13 @@ func (b *Bidder) newWork(work *environment) {
 		return
 	}
 
-	if work.profit.Cmp(common.Big0) <= 0 {
-		return
+	if b.isBestWork(work) {
+		b.setBestWork(work)
 	}
-
-	b.newBidCh <- work
 }
 
 func (b *Bidder) exit() {
 	close(b.exitCh)
-	b.wg.Wait()
 }
 
 // bid notifies the next in-turn validator the work
@@ -275,10 +285,12 @@ func (b *Bidder) bid(work *environment) {
 		}
 	}
 
+	startSend := time.Now()
 	_, err := cli.SendBid(context.Background(), bidArgs)
+	log.Info("Bidder: send bid", "number", work.header.Number, "duration", time.Since(startSend).Milliseconds())
 	if err != nil {
-		b.deleteBestWork(work)
-		log.Error("Bidder: bidding failed", "err", err)
+		log.Error("Bidder: bidding failed", "number", work.header.Number, "txs", len(work.txs),
+			"validator", work.coinbase, "err", err)
 
 		var bidErr rpc.Error
 		ok := errors.As(err, &bidErr)
@@ -289,13 +301,16 @@ func (b *Bidder) bid(work *environment) {
 		return
 	}
 
-	b.deleteBestWork(work)
-	log.Info("Bidder: bidding success", "number", work.header.Number, "txs", len(work.txs))
+	log.Info("Bidder: bidding success", "number", work.header.Number, "txs", len(work.txs), "validator", work.coinbase)
 }
 
 // isBestWork returns the work is better than the current best work
 func (b *Bidder) isBestWork(work *environment) bool {
 	if work.profit == nil {
+		return false
+	}
+
+	if work.profit.Cmp(common.Big0) <= 0 {
 		return false
 	}
 
@@ -316,11 +331,11 @@ func (b *Bidder) setBestWork(work *environment) {
 }
 
 // deleteBestWork sets the best work
-func (b *Bidder) deleteBestWork(work *environment) {
+func (b *Bidder) deleteBestWork(number int64) {
 	b.bestWorksMu.Lock()
 	defer b.bestWorksMu.Unlock()
 
-	delete(b.bestWorks, work.header.Number.Int64())
+	delete(b.bestWorks, number)
 }
 
 // getBestWork returns the best work

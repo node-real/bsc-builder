@@ -281,7 +281,7 @@ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus
 		exitCh:             make(chan struct{}),
 		resubmitIntervalCh: make(chan time.Duration),
 		recentMinedBlocks:  recentMinedBlocks,
-		bidder:             NewBidder(&config.Mev, config.DelayLeftOver, engine, eth),
+		bidder:             NewBidder(&config.Mev, eth.BlockChain(), config.DelayLeftOver, engine, eth),
 		bundleCache:        NewBundleCache(),
 	}
 	// Subscribe events for blockchain
