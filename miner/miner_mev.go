@@ -25,6 +25,7 @@ type MevConfig struct {
 	Builders              []BuilderConfig // The list of builders
 	ValidatorCommission   uint64          // 100 means the validator claims 1% from block reward
 	BidSimulationLeftOver time.Duration
+	BidSendLeftOver       time.Duration
 
 	BuilderEnabled bool              // Whether to enable bidder or not
 	Validators     []ValidatorConfig // The list of validators
